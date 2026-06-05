@@ -1,0 +1,19 @@
+
+version: '3.8'
+
+services:
+  postgres-db:
+    image: postgres:15-alpine
+    container_name: eco_postgres
+    environment:
+      POSTGRES_USER: game_admin
+      POSTGRES_PASSWORD: super_secure_password
+      POSTGRES_DB: economy_service
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+
+volumes:
+  pgdata:
