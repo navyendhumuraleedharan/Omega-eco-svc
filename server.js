@@ -1,11 +1,13 @@
 import express from 'express';
 import pool from './db.js';
-
+import economyRouter from './routes/economy.js';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware to parse incoming JSON bodies automatically
 app.use(express.json());
+
+app.use(economyRouter)
 
 // Diagnostic route to verify database connection pool validity
 app.get('/health', async (req, res) => {

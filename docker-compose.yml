@@ -18,19 +18,19 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
 
-  api:
-    build: .
+  # api:
+  #   build: .
 
-    container_name: eco_api
+  #   container_name: eco_api
 
-    ports:
-      - "3000:3000"
+  #   ports:
+  #     - "3000:3000"
 
-    environment:
-      DATABASE_URL: postgres://game_admin:super_secure_password@postgres-db:5432/economy_service
+  #   environment:
+  #     DATABASE_URL: postgres://game_admin:super_secure_password@postgres-db:5432/economy_service
 
-    depends_on:
-      - postgres-db
+  #   depends_on:
+  #     - postgres-db
 
 volumes:
   pgdata:
