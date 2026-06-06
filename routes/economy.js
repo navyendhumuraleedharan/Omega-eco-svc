@@ -83,69 +83,169 @@ router.get('/v1/wallets/:playerId', async (req, res) => {
 });
 
 
-//claim rewared
+// Claim reward
 router.post('/v1/rewards/:rewardId/claim', async (req, res) => {
     const { rewardId } = req.params;
     const { playerId } = req.body;
 
-    // Validation 
-    if (!rewardId || !playerId || playerId.trim() === '') {
-        return res.status(400).json({ error: 'Missing rewardId in URL or playerId in request body.' });
+    const idempotencyKey = req.header('Idempotency-Key');
+
+    if (!idempotencyKey) {
+        return res.status(400).json({
+            error: 'Missing Idempotency-Key header.'
+        });
     }
 
-    //isolated client from our pool to handle the transaction safely
+    if (!rewardId || !playerId || playerId.trim() === '') {
+        return res.status(400).json({
+            error: 'Missing rewardId in URL or playerId in request body.'
+        });
+    }
+
     const client = await pool.connect();
 
     try {
-        // start database transaction block
+
         await client.query('BEGIN');
 
-        //idempotency check. Attempt to record the claim event
-        try {
-            await client.query(
-                `INSERT INTO claimed_rewards (player_id, reward_id) VALUES ($1, $2);`,
-                [playerId, rewardId]
-            );
-        } catch (dbErr) {
-            // Error Code '23505' Unique Constraint Violation
-            if (dbErr.code === '23505') {
-                // Cancel the transaction since they already claimed it
-                await client.query('ROLLBACK');
-                return res.status(200).json({
-                    message: 'Reward already claimed previously. Deduplicated gracefully.'
-                });
-            }
-            throw dbErr;
-        }
+        console.log('1. BEGIN SUCCESS');
 
-        //REWARD EFFECT: Credit the player with a default reward 
-        await client.query(
-            `INSERT INTO accounts (player_id, balance) 
-       VALUES ($1, 100) 
-       ON CONFLICT (player_id) 
-       DO UPDATE SET balance = accounts.balance + 100;`,
-            [playerId]
+        // IDEMPOTENCY CHECK
+
+
+        const existingRequest = await client.query(
+            `
+            SELECT response_status, response_body
+            FROM processed_requests
+            WHERE idempotency_key = $1
+            `,
+            [idempotencyKey]
         );
 
-        // Save everything permanently to the database
-        await client.query('COMMIT');
+        if (existingRequest.rows.length > 0) {
+            await client.query('COMMIT');
+
+            return res
+                .status(existingRequest.rows[0].response_status)
+                .json(JSON.parse(existingRequest.rows[0].response_body));
+        }
+
+        // Reserve idempotency key
+        await client.query(
+            `
+            INSERT INTO processed_requests (
+                idempotency_key,
+                player_id,
+                request_type,
+                response_status,
+                response_body
+            )
+            VALUES ($1, $2, 'REWARD_CLAIM', 0, '{}')
+            `,
+            [idempotencyKey, playerId]
+        );
+
+        console.log('2. PROCESSED_REQUESTS INSERT SUCCESS');
+
+
+        // REWARD CLAIM CHECK
+
+        try {
+
+            await client.query(
+                `
+                INSERT INTO claimed_rewards (
+                    player_id,
+                    reward_id
+                )
+                VALUES ($1, $2)
+                `,
+                [playerId, rewardId]
+            );
+
+            console.log('3. CLAIMED_REWARDS INSERT SUCCESS');
+
+        } catch (dbErr) {
+
+    console.log("CLAIMED REWARDS ERROR");
+    console.log(dbErr);
+
+    if (dbErr.code === '23505') {
+
+        await client.query('ROLLBACK');
 
         return res.status(200).json({
-            message: 'Reward claimed successfully.',
+            message: 'Reward already claimed previously.',
             rewardId,
             playerId
         });
+    }
+
+    throw dbErr;
+}
+
+
+        // CREDIT REWARD
+
+
+        await client.query(
+            `
+            INSERT INTO accounts (player_id, balance)
+            VALUES ($1, 100)
+            ON CONFLICT (player_id)
+            DO UPDATE
+            SET balance = accounts.balance + 100
+            `,
+            [playerId]
+        );
+
+        console.log('4. ACCOUNT CREDIT SUCCESS');
+
+        const response = {
+            message: 'Reward claimed successfully.',
+            rewardId,
+            playerId
+        };
+
+        // Save response
+        await client.query(
+            `
+            UPDATE processed_requests
+            SET
+                response_status = $1,
+                response_body = $2
+            WHERE idempotency_key = $3
+            `,
+            [
+                200,
+                JSON.stringify(response),
+                idempotencyKey
+            ]
+        );
+
+        await client.query('COMMIT');
+
+        return res.status(200).json(response);
 
     } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Reward claim transaction failure:', error);
-        return res.status(500).json({ error: 'Internal system transaction failure.' });
+
+        try {
+            await client.query('ROLLBACK');
+        } catch { }
+
+        console.error(
+            'Reward claim transaction failure:',
+            error
+        );
+
+        return res.status(500).json({
+            error: 'Internal system transaction failure.'
+        });
+
     } finally {
         client.release();
     }
 });
-
-
 
 //Credt the wallet
 
