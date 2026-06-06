@@ -23,3 +23,5 @@ app.get('/health', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Economy service running natively on http://localhost:${PORT}`);
 });
+
+export default app;
