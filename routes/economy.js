@@ -167,22 +167,32 @@ router.post('/v1/rewards/:rewardId/claim', async (req, res) => {
 
         } catch (dbErr) {
 
-    console.log("CLAIMED REWARDS ERROR");
-    console.log(dbErr);
+            console.log("CLAIMED REWARDS ERROR");
+            console.log(dbErr);
 
-    if (dbErr.code === '23505') {
+            if (dbErr.code === '23505') {
 
-        await client.query('ROLLBACK');
+                await client.query('ROLLBACK');
+                const responseFallback = {
+                    message: 'Reward already claimed previously.',
+                    rewardId,
+                    playerId
+                };
 
-        return res.status(200).json({
-            message: 'Reward already claimed previously.',
-            rewardId,
-            playerId
-        });
-    }
+                await pool.query(
+                    `
+                    UPDATE processed_requests
+                    SET response_status = $1, response_body = $2
+                    WHERE idempotency_key = $3
+                    `,
+                    [200, JSON.stringify(responseFallback), idempotencyKey]
+                );
 
-    throw dbErr;
-}
+                return res.status(200).json(responseFallback);
+            }
+
+            throw dbErr;
+        }
 
 
         // CREDIT REWARD
@@ -200,6 +210,16 @@ router.post('/v1/rewards/:rewardId/claim', async (req, res) => {
         );
 
         console.log('4. ACCOUNT CREDIT SUCCESS');
+
+        //Populating the immutable ledger table for audit logs before saving reward transaction
+
+        await client.query(
+            `
+            INSERT INTO ledger (player_id, operation_type, amount, reference_id)
+            VALUES ($1, 'REWARD_CREDIT', 100, $2)
+            `,
+            [playerId, rewardId]
+        );
 
         const response = {
             message: 'Reward claimed successfully.',
@@ -228,6 +248,29 @@ router.post('/v1/rewards/:rewardId/claim', async (req, res) => {
         return res.status(200).json(response);
 
     } catch (error) {
+
+        if (error.code === '23505') {
+            try { await client.query('ROLLBACK'); } catch {}
+
+            const existing = await pool.query(
+                `SELECT response_status, response_body FROM processed_requests WHERE idempotency_key = $1`,
+                [idempotencyKey]
+            );
+
+            const status = existing.rows[0].response_status;
+
+            // Check if state is in-flight processing (status 0)
+            if (status === 0) {
+                return res.status(409).json({
+                    error: 'Concurrent Request',
+                    message: 'A previous request with this idempotency key is still being processed. Please wait.'
+                });
+            }
+
+            return res
+                .status(status)
+                .json(JSON.parse(existing.rows[0].response_body));
+        }
 
         try {
             await client.query('ROLLBACK');
@@ -346,6 +389,16 @@ router.post('/v1/wallets/:playerId/credit', async (req, res) => {
 
         const updatedBalance = result.rows[0].balance;
 
+        //ledger 
+
+        await client.query(
+            `
+            INSERT INTO ledger (player_id, operation_type, amount, reference_id)
+            VALUES ($1, 'CREDIT', $2, $3)
+            `,
+            [playerId, amount, reason.trim()]
+        );
+
         const response = {
             playerId,
             balance: updatedBalance,
@@ -406,10 +459,17 @@ router.post('/v1/wallets/:playerId/credit', async (req, res) => {
 
 
 // purchase  the inventory
-
 router.post('/v1/wallets/:playerId/purchase', async (req, res) => {
     const { playerId } = req.params;
     const { itemId, price } = req.body;
+
+    const idempotencyKey = req.header('Idempotency-Key');
+
+    if (!idempotencyKey) {
+        return res.status(400).json({
+            error: 'Missing Idempotency-Key header.'
+        });
+    }
 
     // Validation
     if (!playerId || playerId.trim() === '') {
@@ -429,6 +489,41 @@ router.post('/v1/wallets/:playerId/purchase', async (req, res) => {
     try {
         //Start the Atomic Transaction Block
         await client.query('BEGIN');
+
+        try {
+            await client.query(
+                `
+                INSERT INTO processed_requests (
+                  idempotency_key,
+                  player_id,
+                  request_type,
+                  response_status,
+                  response_body
+                )
+                VALUES ($1, $2, 'PURCHASE', 0, '{}')
+                `,
+                [idempotencyKey, playerId]
+            );
+            console.log('INSERT INTO processed_requests SUCCESS FOR PURCHASE');
+        } catch (err) {
+            if (err.code === '23505') {
+                await client.query('ROLLBACK');
+
+                const existing = await pool.query(
+                    `
+                    SELECT response_status, response_body
+                    FROM processed_requests
+                    WHERE idempotency_key = $1
+                    `,
+                    [idempotencyKey]
+                );
+
+                return res
+                    .status(existing.rows[0].response_status)
+                    .json(JSON.parse(existing.rows[0].response_body));
+            }
+            throw err;
+        }
 
         // Fetch current balance and lock the row to avoid data concurrency issues (FOR UPDATE)
         const accountResult = await client.query(
@@ -454,7 +549,7 @@ router.post('/v1/wallets/:playerId/purchase', async (req, res) => {
             [price, playerId]
         );
 
-        //GRANT ITEM: Atomically upsert the item into the player's inventory
+        //Atomically upsert the item into the player's inventory
         await client.query(
             `
       INSERT INTO inventory (player_id, item_id, quantity)
@@ -465,24 +560,55 @@ router.post('/v1/wallets/:playerId/purchase', async (req, res) => {
             [playerId, itemId]
         );
 
+        // Saving the purchase debit event as a negative value into your immutable ledger
+        await client.query(
+            `
+            INSERT INTO ledger (player_id, operation_type, amount, reference_id)
+            VALUES ($1, 'PURCHASE_DEBIT', $2, $3)
+            `,
+            [playerId, -price, itemId]
+        );
+        // <<< END NEW CHANGE
+
+        const response = {
+            message: 'Purchase completed successfully.',
+            playerId,
+            itemId,
+            remainingBalance: currentBalance - price
+        };
+
+        // Updating final logged payload cache for purchase transactions
+        await client.query(
+            `
+            UPDATE processed_requests
+            SET
+              response_status = $1,
+              response_body = $2
+            WHERE idempotency_key = $3
+            `,
+            [
+                200,
+                JSON.stringify(response),
+                idempotencyKey
+            ]
+        );
+
         //Permanently commit all actions together
         await client.query('COMMIT');
 
         console.log(`[PURCHASE SUCCESS] Player: ${playerId} bought ${itemId} for ${price} coins.`);
 
-        return res.status(200).json({
-            message: 'Purchase completed successfully.',
-            playerId,
-            itemId,
-            remainingBalance: currentBalance - price
-        });
+        return res.status(200).json(response);
 
     } catch (error) {
-        await client.query('ROLLBACK');
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackError) {
+            console.error('ROLLBACK FAILED', rollbackError);
+        }
         console.error('Purchase engine transaction crashed:', error);
         return res.status(500).json({ error: 'Internal system transaction failure processing purchase.' });
     } finally {
-        //release the connection back to the pool
         client.release();
     }
 });
