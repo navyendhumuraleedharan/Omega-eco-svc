@@ -7,6 +7,7 @@ const PORT = process.env.PORT || 3000;
 // Middleware to parse incoming JSON bodies automatically
 app.use(express.json());
 
+
 app.use(economyRouter)
 
 // Diagnostic route to verify database connection pool validity

@@ -145,4 +145,59 @@ router.post('/v1/rewards/:rewardId/claim', async (req, res) => {
   }
 });
 
+
+
+//Credt the wallet
+router.post('/v1/wallets/:playerId/credit', async (req, res) => {
+  const { playerId } = req.params;
+  const { amount, reason } = req.body;
+
+  
+  if (!playerId || playerId.trim() === '') {
+    return res.status(400).json({ error: 'Missing or invalid playerId parameter.' });
+  }
+
+  // amount is a number, an integer, and greater than zero
+  if (typeof amount !== 'number' || amount <= 0 || !Number.isInteger(amount)) {
+    return res.status(400).json({ error: 'Amount must be a positive integer greater than 0.' });
+  }
+
+  //reason is present and not just empty whitespace
+  if (!reason || reason.trim() === '') {
+    return res.status(400).json({ error: 'A valid reason string must be provided.' });
+  }
+
+  try {
+    // Safe Database UPSERT operation
+    // If the player row doesn't exist, it inserts it.
+    // If it does exist, it increments the balance atomically.
+    const result = await query(
+      `
+      INSERT INTO accounts (player_id, balance)
+      VALUES ($1, $2)
+      ON CONFLICT (player_id)
+      DO UPDATE SET balance = accounts.balance + EXCLUDED.balance
+      RETURNING balance;
+      `,
+      [playerId, amount]
+    );
+
+    const updatedBalance = result.rows[0].balance;
+
+    // Log the transaction in the server console for clean tracking
+    console.log(`[CREDIT] Player: ${playerId} | Added: +${amount} | New Balance: ${updatedBalance} | Reason: ${reason}`);
+
+    return res.status(200).json({
+      playerId,
+      balance: updatedBalance,
+      reason: reason.trim()
+    });
+
+  } catch (error) {
+    console.error('Wallet credit operation failed:', error);
+    return res.status(500).json({ error: 'Internal server error processing credit operation.' });
+  }
+});
+
+
 export default router;
