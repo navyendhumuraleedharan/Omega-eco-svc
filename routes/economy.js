@@ -200,4 +200,87 @@ router.post('/v1/wallets/:playerId/credit', async (req, res) => {
 });
 
 
+// purchase  the inventory
+
+router.post('/v1/wallets/:playerId/purchase', async (req, res) => {
+  const { playerId } = req.params;
+  const { itemId, price } = req.body;
+
+  // Validation
+  if (!playerId || playerId.trim() === '') {
+    return res.status(400).json({ error: 'Missing or invalid playerId parameter.' });
+  }
+
+  if (!itemId || itemId.trim() === '') {
+    return res.status(400).json({ error: 'Missing or invalid itemId in request body.' });
+  }
+
+  if (typeof price !== 'number' || price <= 0 || !Number.isInteger(price)) {
+    return res.status(400).json({ error: 'Price must be a positive integer greater than 0.' });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    //Start the Atomic Transaction Block
+    await client.query('BEGIN');
+
+    // Fetch current balance and lock the row to avoid data concurrency issues (FOR UPDATE)
+    const accountResult = await client.query(
+      `SELECT balance FROM accounts WHERE player_id = $1 FOR UPDATE;`,
+      [playerId]
+    );
+
+    const currentBalance = accountResult.rows.length > 0 ? accountResult.rows[0].balance : 0;
+
+    // INSUFFICIENT FUNDS CHECK
+    if (currentBalance < price) {
+      // Immediately cancel the transaction without changing anything!
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Insufficient funds',
+        message: `Player has a balance of ${currentBalance}, but the item costs ${price}.`
+      });
+    }
+
+    // Debit: Deduct the price from the player's wallet balance
+    await client.query(
+      `UPDATE accounts SET balance = balance - $1 WHERE player_id = $2;`,
+      [price, playerId]
+    );
+
+    //GRANT ITEM: Atomically upsert the item into the player's inventory
+    await client.query(
+      `
+      INSERT INTO inventory (player_id, item_id, quantity)
+      VALUES ($1, $2, 1)
+      ON CONFLICT (player_id, item_id)
+      DO UPDATE SET quantity = inventory.quantity + 1;
+      `,
+      [playerId, itemId]
+    );
+
+    //Permanently commit all actions together
+    await client.query('COMMIT');
+
+    console.log(`[PURCHASE SUCCESS] Player: ${playerId} bought ${itemId} for ${price} coins.`);
+
+    return res.status(200).json({
+      message: 'Purchase completed successfully.',
+      playerId,
+      itemId,
+      remainingBalance: currentBalance - price
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Purchase engine transaction crashed:', error);
+    return res.status(500).json({ error: 'Internal system transaction failure processing purchase.' });
+  } finally {
+    //release the connection back to the pool
+    client.release();
+  }
+});
+
+
 export default router;
