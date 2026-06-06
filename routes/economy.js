@@ -172,14 +172,18 @@ router.post('/v1/rewards/:rewardId/claim', async (req, res) => {
 
             if (dbErr.code === '23505') {
 
-                await client.query('ROLLBACK');
+                // await client.query('ROLLBACK');
+
+                //When inserting a duplicate reward fails, 
+                // we must update the state status in processed_requests 
+                // and gracefully save the response before returning                 
                 const responseFallback = {
                     message: 'Reward already claimed previously.',
                     rewardId,
                     playerId
                 };
 
-                await pool.query(
+                await client.query(
                     `
                     UPDATE processed_requests
                     SET response_status = $1, response_body = $2
@@ -187,6 +191,8 @@ router.post('/v1/rewards/:rewardId/claim', async (req, res) => {
                     `,
                     [200, JSON.stringify(responseFallback), idempotencyKey]
                 );
+
+                await client.query('COMMIT');
 
                 return res.status(200).json(responseFallback);
             }
@@ -249,10 +255,12 @@ router.post('/v1/rewards/:rewardId/claim', async (req, res) => {
 
     } catch (error) {
 
-        if (error.code === '23505') {
-            try { await client.query('ROLLBACK'); } catch {}
+        //concurrent request checking
 
-            const existing = await pool.query(
+        if (error.code === '23505') {
+            try { await client.query('ROLLBACK'); } catch { }
+
+            const existing = await client.query(
                 `SELECT response_status, response_body FROM processed_requests WHERE idempotency_key = $1`,
                 [idempotencyKey]
             );
@@ -353,7 +361,7 @@ router.post('/v1/wallets/:playerId/credit', async (req, res) => {
 
                 await client.query('ROLLBACK');
 
-                const existing = await pool.query(
+                const existing = await client.query(
                     `
             SELECT response_status, response_body
             FROM processed_requests
@@ -362,11 +370,23 @@ router.post('/v1/wallets/:playerId/credit', async (req, res) => {
                     [idempotencyKey]
                 );
 
+                const status = existing.rows[0].response_status;
+
+                // Add the 409 Conflict check for concurrent
+                //requests where status is currently still locked at 0.
+
+                if (status === 0) {
+                    return res.status(409).json({
+                        error: 'Concurrent Request',
+                        message: 'A previous request with this idempotency key is still being processed. Please wait.'
+                    });
+                }
+
+
                 return res
-                    .status(existing.rows[0].response_status)
+                    .status(status)
                     .json(JSON.parse(existing.rows[0].response_body));
             }
-
             throw err;
 
         }
@@ -509,7 +529,7 @@ router.post('/v1/wallets/:playerId/purchase', async (req, res) => {
             if (err.code === '23505') {
                 await client.query('ROLLBACK');
 
-                const existing = await pool.query(
+                const existing = await client.query(
                     `
                     SELECT response_status, response_body
                     FROM processed_requests
@@ -518,8 +538,19 @@ router.post('/v1/wallets/:playerId/purchase', async (req, res) => {
                     [idempotencyKey]
                 );
 
+                const status = existing.rows[0].response_status;
+
+                //Add the 409 Conflict check for concurrent
+                //requests where status is currently still locked at 0.
+                if (status === 0) {
+                    return res.status(409).json({
+                        error: 'Concurrent Request',
+                        message: 'A previous request with this idempotency key is still being processed. Please wait.'
+                    });
+                }
+
                 return res
-                    .status(existing.rows[0].response_status)
+                    .status(status)
                     .json(JSON.parse(existing.rows[0].response_body));
             }
             throw err;
@@ -568,7 +599,7 @@ router.post('/v1/wallets/:playerId/purchase', async (req, res) => {
             `,
             [playerId, -price, itemId]
         );
-        // <<< END NEW CHANGE
+
 
         const response = {
             message: 'Purchase completed successfully.',
