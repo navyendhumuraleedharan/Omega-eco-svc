@@ -21,7 +21,7 @@ We chose a relational database with strict ACID compliance over a NoSQL or pure 
 
 The physical data model is strictly designed to guarantee structural integrity at the storage engine layer, ensuring application bugs can never corrupt state.
 
-```text
+```text 
        [ Incoming HTTP Request with Idempotency-Key ]
                              │
                              ▼
@@ -48,6 +48,7 @@ The physical data model is strictly designed to guarantee structural integrity a
    │PK: player_id,  ││PK: reward_id,  ││PK: id (Serial) │
    │    item_id     ││    player_id   ││   player_id    │
    └────────────────┘└────────────────┘└────────────────┘
+``` 
 
 ### Table Definitions & Safety Mechanics
 
@@ -73,7 +74,7 @@ To handle network retries gracefully without executing side-effects multiple tim
 ### The `processed_requests` Lifecycle
 We maintain an authoritative idempotency state ledger using the `processed_requests` table:
 
-
+```text 
 
               [ Incoming Request ]
                        │
@@ -93,6 +94,7 @@ We maintain an authoritative idempotency state ledger using the `processed_reque
                        │
                        ▼
                     COMMIT
+```        
 
 
 ### Key Retention Policy (Production Recommendation)
