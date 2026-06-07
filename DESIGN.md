@@ -17,6 +17,55 @@ We chose a relational database with strict ACID compliance over a NoSQL or pure 
 
 ---
 
+## 1.1 Database Schema & Data Integrity Constraints
+
+The physical data model is strictly designed to guarantee structural integrity at the storage engine layer, ensuring application bugs can never corrupt state.
+
+```text
+       [ Incoming HTTP Request with Idempotency-Key ]
+                             │
+                             ▼
+              ┌──────────────────────────────┐
+              │      processed_requests      │
+              ├──────────────────────────────┤
+              │ PK: idempotency_key          │
+              └──────────────┬───────────────┘
+                             │
+               (If Unique / Lock Secured)
+                             │
+                             ▼
+                      ┌──────────────┐
+                      │   accounts   │
+                      ├──────────────┤
+                      │ PK:player_id │
+                      └──────┬───────┘
+                             │
+            ┌────────────────┼────────────────┐
+            ▼                ▼                ▼
+   ┌────────────────┐┌────────────────┐┌────────────────┐
+   │   inventory    ││claimed_rewards ││     ledger     │
+   ├────────────────┤├────────────────┤├────────────────┤
+   │PK: player_id,  ││PK: reward_id,  ││PK: id (Serial) │
+   │    item_id     ││    player_id   ││   player_id    │
+   └────────────────┘└────────────────┘└────────────────┘
+
+### Table Definitions & Safety Mechanics
+
+* **`accounts`**: Holds the authoritative financial state for each user.
+  * *Safety Guard:* Enforces an immutable database-level engine constraint: `CHECK (balance >= 0)`. If an application edge case attempts to over-deduct a wallet, PostgreSQL forcefully throws an exception and rolls back the operation at the core engine boundary.
+* **`inventory`**: Tracks item allocations using a composite primary key (`player_id`, `item_id`).
+  * *Safety Guard:* Utilizes `CHECK (quantity > 0)` and handles acquisitions via `ON CONFLICT (player_id, item_id) DO UPDATE` to gracefully increment quantities atomically without duplicating rows.
+* **`claimed_rewards`**: Enforces strict unique constraints on reward eligibility using a composite primary key (`reward_id`, `player_id`). This physically stops a player from claiming a one-time promo code or milestone reward multiple times.
+* **`processed_requests`**: The primary data layer driving our exactly-once execution engine. It stores incoming unique `idempotency_key` strings along with their cached HTTP response body status states.
+* **`ledger`**: An immutable, append-only financial audit trail tracking every single atomic movement of currency (`CREDIT`, `PURCHASE_DEBIT`, `REWARD_CREDIT`). It features no update paths, ensuring total historical traceability for troubleshooting or accounting audits.
+
+### Indexing Optimization Strategy
+To maintain stable $O(1)$ to $O(\log N)$ query lookup times as player records scale into the millions, targeted secondary indexes are built explicitly over foreign query paths:
+* **`idx_ledger_player`**: Fast historical pagination audits.
+* **`idx_processed_requests_player`**: Instant state tracking evaluation loops.
+* **`idx_claimed_rewards_player`**: Immediate confirmation bounds for claiming flows.
+---
+
 ## 2. Idempotency & Exactly-Once Strategy
 
 To handle network retries gracefully without executing side-effects multiple times, the service mandates an `Idempotency-Key` header for all mutating endpoints (`/credit`, `/purchase`, `/claim`).
@@ -77,16 +126,14 @@ If the identical `Idempotency-Key` is sent in rapid parallel succession, the dat
 
 ### Layer 2: Row-Level Locking via `FOR UPDATE` (Different Requests, Same Wallet)
 When different requests aim to modify the *same* wallet simultaneously, we execute a pessimistic row lock:
+
 ```sql
 SELECT balance FROM accounts WHERE player_id = $1 FOR UPDATE;
+```
 
 This forces PostgreSQL to lock that specific player's account row. Any other concurrent transaction attempting to read or write to that specific player's balance must pause and queue sequentially behind the primary lock holder. This completely prevents lost updates or racing deductions.
 
 ---
-
-
-
-
 ## 5. API Contract Specifications
 
 ### Success & Error Mappings
